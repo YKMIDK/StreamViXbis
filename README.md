@@ -1,4 +1,6 @@
-![image](https://github.com/user-attachments/assets/11956b44-f742-42cc-a9f0-40fbb1c9de61)
+
+<img width="230" height="293" alt="icon" src="https://github.com/user-attachments/assets/11ef8b0e-6d55-44a4-9ccc-ae7031e99f34" />
+
 # 🎬 StreamViX
 
 Un addon per Stremio che estrae sorgenti streaming dai siti vixsrc e animeunity animesaturn daddy e vavoo per permetterti di guardare film, serie TV, anime e tv con la massima semplicità.
@@ -11,10 +13,19 @@ Un addon per Stremio che estrae sorgenti streaming dai siti vixsrc e animeunity 
 * **📺 Supporto Serie TV:** Trova flussi per ogni episodio di una serie TV, basandosi su ID TMDB in formato stagione/episodio.
 * **⛩️ Supporto Anime:** Trova flussi per ogni episodio di una determinato Anime, ora supporta ricerca sia da cinemeta, sia da tmdb che da kitsu.
 * **📡 Supporto Live TV:** Canali TV italiani con EPG integrato.
+* **📡 Supporto Eventi Sportivi:** Eventi sportivi aggiornati ogni giorno.
 * **🔗 Integrazione Perfetta:** Si integra meravigliosamente con l'interfaccia di Stremio per un'esperienza utente fluida.
 * **🌐 Proxy Unificato:** Un solo proxy MFP per tutti i contenuti (film, serie, anime, TV).
 
 ---
+Comandi per Live TV da browser
+
+http://urladdon/live/update   aggiorna lista live events
+
+http://urladdon/live/purge    cancella vecchi eventi
+
+http://urladdon/live/reload   aggiorna il catalogo stremio 
+
 
 ## 🔧 Configurazione Semplificata
 
@@ -163,6 +174,13 @@ Questo progetto è inteso esclusivamente a scopo educativo. L'utente è l'unico 
 Original extraction logic written by https://github.com/mhdzumair for the extractor code https://github.com/mhdzumair/mediaflow-proxy 
 Thanks to https://github.com/ThEditor https://github.com/ThEditor/stremsrc for the main code and stremio addon
 Un ringraziamento speciale a @UrloMythus per gli extractor e per la logica kitsu
+
+
+
+
+
+
+
 
 
 

@@ -5,13 +5,110 @@ import { landingTemplate } from './landingPage';
 import * as path from 'path';
 import express, { Request, Response, NextFunction } from 'express'; // ✅ CORRETTO: Import tipizzato
 import { AnimeUnityProvider } from './providers/animeunity-provider';
+import { AnimeWorldProvider } from './providers/animeworld-provider';
 import { KitsuProvider } from './providers/kitsu'; 
 import { formatMediaFlowUrl } from './utils/mediaflow';
+import { mergeDynamic, loadDynamicChannels, purgeOldDynamicEvents, invalidateDynamicChannels, getDynamicSignature } from './utils/dynamicChannels';
+
+// --- Lightweight declarations to avoid TS complaints if @types/node non installati ---
+// (Non sostituiscono l'uso consigliato di @types/node, ma evitano errori bloccanti.)
+// eslint-disable-next-line @typescript-eslint/no-explicit-any
+declare const __dirname: string;
+// eslint-disable-next-line @typescript-eslint/no-explicit-any
+declare const process: any;
+// eslint-disable-next-line @typescript-eslint/no-explicit-any
+declare const Buffer: any;
+// eslint-disable-next-line @typescript-eslint/no-explicit-any
+declare function require(name: string): any;
 import { AnimeUnityConfig } from "./types/animeunity";
 import { EPGManager } from './utils/epg';
 import { execFile } from 'child_process';
 import * as crypto from 'crypto';
 import * as util from 'util';
+
+// ================= TYPES & INTERFACES =================
+interface AddonConfig {
+    tmdbApiKey?: string;
+    mediaFlowProxyUrl?: string;
+    mediaFlowProxyPassword?: string;
+    enableMpd?: boolean;
+    animeunityEnabled?: boolean;
+    animesaturnEnabled?: boolean;
+    animeworldEnabled?: boolean;
+}
+
+function debugLog(...args: any[]) {
+    try {
+        console.log('[DEBUG]', ...args);
+    } catch {
+        // ignore
+    }
+}
+
+// === CACHE: Dynamic event stream extraction (per d.url) ===
+// Key: `${mfpUrl}|${mfpPsw}|${originalDUrl}` -> { finalUrl, ts }
+const dynamicStreamCache = new Map<string, { finalUrl: string; ts: number }>();
+const DYNAMIC_STREAM_TTL_MS = 5 * 60 * 1000; // 5 minuti
+
+async function resolveDynamicEventUrl(dUrl: string, providerTitle: string, mfpUrl?: string, mfpPsw?: string): Promise<{ url: string; title: string }> {
+    // Se manca proxy config, ritorna immediatamente l'URL originale (fast path)
+    if (!mfpUrl || !mfpPsw) return { url: dUrl, title: providerTitle };
+    const cacheKey = `${mfpUrl}|${mfpPsw}|${dUrl}`;
+    const now = Date.now();
+    const cached = dynamicStreamCache.get(cacheKey);
+    if (cached && (now - cached.ts) < DYNAMIC_STREAM_TTL_MS) {
+        return { url: cached.finalUrl, title: providerTitle };
+    }
+    const extractorUrl = `${mfpUrl}/extractor/video?host=DLHD&redirect_stream=false&api_password=${encodeURIComponent(mfpPsw)}&d=${encodeURIComponent(dUrl)}`;
+    try {
+        const res = await fetch(extractorUrl);
+        if (res.ok) {
+            const data = await res.json();
+            let finalUrl = data.mediaflow_proxy_url || `${mfpUrl}/proxy/hls/manifest.m3u8`;
+            if (data.query_params) {
+                const params = new URLSearchParams();
+                for (const [k, v] of Object.entries(data.query_params)) {
+                    if (v !== null) params.append(k, String(v));
+                }
+                finalUrl += (finalUrl.includes('?') ? '&' : '?') + params.toString();
+            }
+            if (data.destination_url) finalUrl += (finalUrl.includes('?') ? '&' : '?') + 'd=' + encodeURIComponent(data.destination_url);
+            if (data.request_headers) {
+                for (const [hk, hv] of Object.entries(data.request_headers)) {
+                    if (hv !== null) finalUrl += '&h_' + hk + '=' + encodeURIComponent(String(hv));
+                }
+            }
+            dynamicStreamCache.set(cacheKey, { finalUrl, ts: now });
+            return { url: finalUrl, title: providerTitle };
+        } else {
+            const fallback = `${mfpUrl}/extractor/video?host=DLHD&redirect_stream=true&api_password=${encodeURIComponent(mfpPsw)}&d=${encodeURIComponent(dUrl)}`;
+            dynamicStreamCache.set(cacheKey, { finalUrl: fallback, ts: now });
+            return { url: fallback, title: providerTitle };
+        }
+    } catch {
+        const fallback = `${mfpUrl}/extractor/video?host=DLHD&redirect_stream=true&api_password=${encodeURIComponent(mfpPsw)}&d=${encodeURIComponent(dUrl)}`;
+        dynamicStreamCache.set(cacheKey, { finalUrl: fallback, ts: now });
+        return { url: fallback, title: providerTitle };
+    }
+}
+
+// Global runtime configuration cache (was referenced below)
+const configCache: AddonConfig = {};
+
+// Promisify execFile for reuse
+const execFilePromise = util.promisify(execFile);
+
+// Placeholder helper for categories; implement real logic later or ensure existing util present
+function getChannelCategories(channel: any): string[] {
+    if (!channel) return [];
+    // Gestione array
+    if (Array.isArray(channel.category)) return channel.category.map((c: any) => String(c).toLowerCase());
+    if (Array.isArray(channel.categories)) return channel.categories.map((c: any) => String(c).toLowerCase());
+    // Gestione stringa singola
+    if (typeof channel.category === 'string' && channel.category.trim() !== '') return [channel.category.toLowerCase()];
+    if (typeof channel.categories === 'string' && channel.categories.trim() !== '') return [channel.categories.toLowerCase()];
+    return [];
+}
 
 // Funzioni utility per decodifica base64
 function decodeBase64(str: string): string {
@@ -27,14 +124,9 @@ function decodeStaticUrl(url: string): string {
     try {
         // Assicura padding corretto (lunghezza multipla di 4)
         let paddedUrl = url;
-        while (paddedUrl.length % 4 !== 0) {
-            paddedUrl += '=';
-        }
-        
-        // Decodifica base64
+        while (paddedUrl.length % 4 !== 0) paddedUrl += '=';
         const decoded = decodeBase64(paddedUrl);
         console.log(`✅ [Base64] URL decodificato: ${decoded}`);
-        
         return decoded;
     } catch (error) {
         console.error(`❌ [Base64] Errore nella decodifica: ${error}`);
@@ -43,58 +135,16 @@ function decodeStaticUrl(url: string): string {
     }
 }
 
-// Promisify execFile
-const execFilePromise = util.promisify(execFile);
-
-// Interfaccia per la configurazione URL
-interface AddonConfig {
-  mediaFlowProxyUrl?: string;
-  mediaFlowProxyPassword?: string;
-  tmdbApiKey?: string;
-  enableMpd?: string;
-  animeunityEnabled?: string;
-  animesaturnEnabled?: string;
-  enableLiveTV?: string;
-  [key: string]: any;
-}
-
-// Cache globale per la configurazione
-const configCache: AddonConfig = {
-  mediaFlowProxyUrl: process.env.MFP_URL,
-  mediaFlowProxyPassword: process.env.MFP_PSW,
-  tmdbApiKey: process.env.TMDB_API_KEY || '40a9faa1f6741afb2c0c40238d85f8d0',
-  enableLiveTV: 'on'
-};
-
-// Funzione globale per log di debug
-const debugLog = (message: string, ...params: any[]) => {
-    console.log(`🔧 ${message}`, ...params);
-    
-    // Scrivi anche su file di log
-    try {
-        const logPath = path.join(__dirname, '../logs');
-        if (!fs.existsSync(logPath)) {
-            fs.mkdirSync(logPath, { recursive: true });
-        }
-        const logFile = path.join(logPath, 'config_debug.log');
-        const timestamp = new Date().toISOString();
-        const logMessage = `${timestamp} - ${message} ${params.length ? JSON.stringify(params) : ''}\n`;
-        fs.appendFileSync(logFile, logMessage);
-    } catch (e) {
-        console.error('Error writing to log file:', e);
-    }
-};
-
-// Base manifest configuration
+// ================= MANIFEST BASE (restored) =================
 const baseManifest: Manifest = {
     id: "org.stremio.vixcloud",
-    version: "4.0.1",
+    version: "5.3.2",
     name: "StreamViX",
-    description: "Addon for Vixsrc, AnimeUnity streams and Live TV.", 
-    icon: "/public/icon.png",
-    background: "/public/backround.png",
-    types: ["movie", "series", "tv"],
-    idPrefixes: ["tt", "kitsu", "tv"],
+    description: "Addon for Vixsrc, Anime providers and Live TV.",
+    icon: "https://raw.githubusercontent.com/qwertyuiop8899/StreamViX/refs/heads/main/public/icon.png",
+    background: "https://raw.githubusercontent.com/qwertyuiop8899/StreamViX/refs/heads/main/public/backround.png",
+    types: ["movie", "series", "tv", "anime"],
+    idPrefixes: ["tt", "kitsu", "tv", "mal", "tmdb"],
     catalogs: [
         {
             type: "tv",
@@ -108,58 +158,46 @@ const baseManifest: Manifest = {
                         "RAI",
                         "Mediaset", 
                         "Sky",
-                        "Bambini",
-                        "News",
                         "Sport",
                         "Cinema",
-                        "Generali",
                         "Documentari",
-                        "Pluto"
+                        "Discovery",
+                        "News",
+                        "Generali",
+                        "Bambini",
+                        "Pluto",
+                        "Serie A",
+                        "Serie B",
+                        "Serie C",
+                        "Coppe",
+                        "Tennis",
+                        "F1",
+                        "MotoGp",
+                        "Basket",
+                        "Volleyball",
+                        "Ice Hockey",
+                        "Wrestling",
+                        "Boxing",
+                        "Darts",
+                        "Baseball",
+                        "NFL"
                     ]
-                }
+                },
+                { name: "genre", isRequired: false },
+                { name: "search", isRequired: false }
             ]
         }
     ],
     resources: ["stream", "catalog", "meta"],
-    behaviorHints: {
-        configurable: true
-    },
+    behaviorHints: { configurable: true },
     config: [
-        {
-            key: "tmdbApiKey",
-            title: "TMDB API Key",
-            type: "text"
-        },
-        {
-            key: "mediaFlowProxyUrl", 
-            title: "MediaFlow Proxy URL",
-            type: "text"
-        },
-        {
-            key: "mediaFlowProxyPassword",
-            title: "MediaFlow Proxy Password", 
-            type: "text"
-        },
-        {
-            key: "enableMpd",
-            title: "Enable MPD Streams",
-            type: "checkbox"
-        },
-        {
-            key: "animeunityEnabled",
-            title: "Enable AnimeUnity",
-            type: "checkbox"
-        },
-        {
-            key: "animesaturnEnabled",
-            title: "Enable AnimeSaturn",
-            type: "checkbox"
-        },
-        {
-            key: "enableLiveTV",
-            title: "Enable Live TV",
-            type: "checkbox"
-        }
+        { key: "tmdbApiKey", title: "TMDB API Key", type: "text" },
+        { key: "mediaFlowProxyUrl", title: "MediaFlow Proxy URL", type: "text" },
+        { key: "mediaFlowProxyPassword", title: "MediaFlow Proxy Password", type: "text" },
+        { key: "enableMpd", title: "Enable MPD Streams", type: "checkbox" },
+        { key: "animeunityEnabled", title: "Enable AnimeUnity", type: "checkbox" },
+        { key: "animesaturnEnabled", title: "Enable AnimeSaturn", type: "checkbox" },
+        { key: "animeworldEnabled", title: "Enable AnimeWorld", type: "checkbox" }
     ]
 };
 
@@ -290,6 +328,7 @@ function parseConfigFromArgs(args: any): AddonConfig {
 
 // Carica canali TV e domini da file esterni
 let tvChannels: any[] = [];
+let staticBaseChannels: any[] = [];
 let domains: any = {};
 let epgConfig: any = {};
 let epgManager: EPGManager | null = null;
@@ -424,7 +463,8 @@ try {
     // Assicurati che le directory di cache esistano
     ensureCacheDirectories();
     
-    tvChannels = JSON.parse(fs.readFileSync(path.join(__dirname, '../config/tv_channels.json'), 'utf-8'));
+    staticBaseChannels = JSON.parse(fs.readFileSync(path.join(__dirname, '../config/tv_channels.json'), 'utf-8'));
+    tvChannels = [...staticBaseChannels];
     domains = JSON.parse(fs.readFileSync(path.join(__dirname, '../config/domains.json'), 'utf-8'));
     epgConfig = JSON.parse(fs.readFileSync(path.join(__dirname, '../config/epg_config.json'), 'utf-8'));
     
@@ -627,135 +667,6 @@ try {
 }
 
 // Funzione per determinare le categorie di un canale
-function getChannelCategories(channel: any): string[] {
-    const categories: string[] = [];
-    
-    if (Array.isArray(channel.categories)) {
-        categories.push(...channel.categories);
-    } else if (Array.isArray(channel.category)) {
-        categories.push(...channel.category);
-    } else if (channel.category) {
-        categories.push(channel.category);
-    }
-    
-    if (categories.length === 0) {
-        const name = channel.name.toLowerCase();
-        const description = channel.description.toLowerCase();
-        
-        if (name.includes('rai') || description.includes('rai')) {
-            categories.push('rai');
-        }
-        if (name.includes('mediaset') || description.includes('mediaset') || 
-            name.includes('canale 5') || name.includes('italia') || name.includes('rete 4')) {
-            categories.push('mediaset');
-        }
-        if (name.includes('sky') || description.includes('sky')) {
-            categories.push('sky');
-        }
-        if (name.includes('gulp') || name.includes('yoyo') || name.includes('boing') || name.includes('cartoonito')) {
-            categories.push('kids');
-        }
-        if (name.includes('news') || name.includes('tg') || name.includes('focus')) {
-            categories.push('news');
-        }
-        if (name.includes('sport') || name.includes('tennis') || name.includes('eurosport')) {
-            categories.push('sport');
-        }
-        if (name.includes('cinema') || name.includes('movie') || name.includes('warner')) {
-            categories.push('movies');
-        }
-        if (name.includes('pluto') || description.includes('pluto')) {
-            categories.push('pluto');
-        }
-        
-        if (categories.length === 0) {
-            categories.push('general');
-        }
-    }
-    
-    return categories;
-}
-
-// Funzione per risolvere un canale Vavoo usando la cache
-function resolveVavooChannelByName(channelName: string): Promise<string | null> {
-    return new Promise((resolve) => {
-        // Check cache age
-        const cacheAge = Date.now() - vavooCache.timestamp;
-        const CACHE_MAX_AGE = 12 * 60 * 60 * 1000; // 12 ore in millisecondi
-        
-        // Se la cache è troppo vecchia o vuota, forzane l'aggiornamento (ma continua comunque a usarla)
-        if (cacheAge > CACHE_MAX_AGE || vavooCache.links.size === 0) {
-            console.log(`[Vavoo] Cache obsoleta o vuota (età: ${Math.round(cacheAge/3600000)}h), avvio aggiornamento in background...`);
-            // Non blocchiamo la risposta, aggiorniamo in background
-            updateVavooCache().catch(error => {
-                console.error(`[Vavoo] Errore nell'aggiornamento cache:`, error);
-            });
-        }
-        
-        // Cerca il canale nella cache
-        if (channelName && vavooCache.links.has(channelName)) {
-            const cachedUrlRaw = vavooCache.links.get(channelName);
-            let cachedUrl: string | null = null;
-            if (Array.isArray(cachedUrlRaw)) {
-                cachedUrl = cachedUrlRaw[0] || null;
-            } else if (typeof cachedUrlRaw === 'string') {
-                cachedUrl = cachedUrlRaw;
-            }
-            console.log(`[Vavoo] Trovato in cache: ${channelName} -> ${cachedUrl ? cachedUrl.substring(0, 50) : 'null'}...`);
-            return resolve(cachedUrl);
-        }
-        
-        // Se non è nella cache ma la cache è stata inizializzata
-        if (vavooCache.timestamp > 0) {
-            console.log(`[Vavoo] Canale ${channelName} non trovato in cache, aggiornamento necessario`);
-            // Tenta di aggiornare la cache in background se non è già in corso
-            if (!vavooCache.updating) {
-                updateVavooCache().catch(error => {
-                    console.error(`[Vavoo] Errore nell'aggiornamento cache:`, error);
-                });
-            }
-            return resolve(null);
-        }
-        
-        // Se la cache non è ancora stata inizializzata, chiama lo script Python come fallback
-        console.log(`[Vavoo] Cache non inizializzata, chiamo script Python per ${channelName}`);
-        const timeout = setTimeout(() => {
-            console.log(`[Vavoo] Timeout per canale: ${channelName}`);
-            resolve(null);
-        }, 5000);
-
-        const options = {
-            timeout: 5000,
-            env: {
-                ...process.env,
-                PYTHONPATH: '/usr/local/lib/python3.9/site-packages'
-            }
-        };
-        
-        execFile('python3', [path.join(__dirname, '../vavoo_resolver.py'), channelName, '--original-link'], options, (error: Error | null, stdout: string, stderr: string) => {
-            clearTimeout(timeout);
-            
-            if (error) {
-                console.error(`[Vavoo] Error for ${channelName}:`, error.message);
-                if (stderr) console.error(`[Vavoo] Stderr:`, stderr);
-                return resolve(null);
-            }
-            
-            if (!stdout || stdout.trim() === '') {
-                console.log(`[Vavoo] No output for ${channelName}`);
-                return resolve(null);
-            }
-            
-            const result = stdout.trim();
-            console.log(`[Vavoo] Resolved ${channelName} to: ${result.substring(0, 50)}...`);
-            
-            // Aggiorna la cache con questo risultato
-            vavooCache.links.set(channelName, result);
-            
-            resolve(result);
-        });
-    });
-}
 
 function normalizeProxyUrl(url: string): string {
     return url.endsWith('/') ? url.slice(0, -1) : url;
@@ -771,43 +682,144 @@ function createBuilder(initialConfig: AddonConfig = {}) {
     
     const builder = new addonBuilder(manifest);
 
-    // === HANDLER CATALOGO TV ===
+    // === TV CATALOG HANDLER ONLY ===
     builder.defineCatalogHandler(async ({ type, id, extra }: { type: string; id: string; extra?: any }) => {
-        console.log(`📺 CATALOG REQUEST: type=${type}, id=${id}, extra=${JSON.stringify(extra)}`);
         if (type === "tv") {
-            let filteredChannels = tvChannels;
-            
-            // Filtra per genere se specificato
-            if (extra && extra.genre) {
-                const genre = extra.genre;
-                console.log(`🔍 Filtering by genre: ${genre}`);
-                
-                // Mappa i nomi dei generi dal manifest ai nomi delle categorie
-                const genreMap: { [key: string]: string } = {
-                    "RAI": "rai",
-                    "Mediaset": "mediaset", 
-                    "Sky": "sky",
-                    "Bambini": "kids",
-                    "News": "news",
-                    "Sport": "sport",
-                    "Cinema": "movies",
-                    "Generali": "general",
-                    "Documentari": "documentari",
-                    "Pluto": "pluto"
-                };
-                
-                const targetCategory = genreMap[genre];
-                if (targetCategory) {
-                    filteredChannels = tvChannels.filter((channel: any) => {
-                        const categories = getChannelCategories(channel);
-                        return categories.includes(targetCategory);
-                    });
-                    console.log(`✅ Filtered to ${filteredChannels.length} channels in category: ${targetCategory}`);
-                } else {
-                    console.log(`⚠️ Unknown genre: ${genre}`);
+            // === FAST CACHE LAYER per catalogo TV ===
+            // Evita merge/ricostruzione se né i canali statici né i dinamici sono cambiati.
+            // Usiamo una signature (mtime:length) dei dinamici + dimensione statici.
+            const dynamicSig = getDynamicSignature();
+            const staticSig = staticBaseChannels.length;
+            const cacheKey = `${dynamicSig}|${staticSig}`;
+            // Cache in memoria condivisa (process-wide)
+            const g: any = global as any;
+            if (!g.__tvCatalogCache) g.__tvCatalogCache = { key: '', channels: [] };
+            if (g.__tvCatalogCache.key !== cacheKey) {
+                try {
+                    loadDynamicChannels(false); // aggiorna cache interna se TTL scaduto o file cambiato
+                    tvChannels = mergeDynamic([...staticBaseChannels]);
+                    g.__tvCatalogCache = { key: cacheKey, channels: tvChannels };
+                    debugLog(`⚡ Catalog rebuild (cache miss) newKey=${cacheKey} count=${tvChannels.length}`);
+                } catch (e) {
+                    console.error('❌ Merge dynamic channels failed:', e);
                 }
             } else {
-                console.log(`📺 No genre filter, showing all ${tvChannels.length} channels`);
+                tvChannels = g.__tvCatalogCache.channels;
+                debugLog(`⚡ Catalog served from cache key=${cacheKey} count=${tvChannels.length}`);
+            }
+            let filteredChannels = tvChannels;
+            let requestedSlug: string | null = null;
+
+            // === SEARCH HANDLER ===
+            if (extra && typeof extra.search === 'string' && extra.search.trim().length > 0) {
+                const rawQ = extra.search.trim();
+                const tokens = rawQ.toLowerCase().split(/\s+/).filter(Boolean);
+                console.log(`🔎 Search (OR+fuzzy) query tokens:`, tokens);
+                const seen = new Set<string>();
+
+                const simpleLevenshtein = (a: string, b: string): number => {
+                    if (a === b) return 0;
+                    const al = a.length, bl = b.length;
+                    if (Math.abs(al - bl) > 1) return 99; // prune (we only care distance 0/1)
+                    const dp: number[] = Array(bl + 1).fill(0);
+                    for (let j = 0; j <= bl; j++) dp[j] = j;
+                    for (let i = 1; i <= al; i++) {
+                        let prev = dp[0];
+                        dp[0] = i;
+                        for (let j = 1; j <= bl; j++) {
+                            const tmp = dp[j];
+                            if (a[i - 1] === b[j - 1]) dp[j] = prev; else dp[j] = Math.min(prev + 1, dp[j] + 1, dp[j - 1] + 1);
+                            prev = tmp;
+                        }
+                    }
+                    return dp[bl];
+                };
+
+                const tokenMatches = (token: string, hay: string, words: string[]): boolean => {
+                    if (!token) return false;
+                    if (hay.includes(token)) return true; // substring
+                    // prefix match on any word
+                    if (words.some(w => w.startsWith(token))) return true;
+                    // fuzzy distance 1 on words (only if token length > 3 to avoid noise)
+                    if (token.length > 3) {
+                        for (const w of words) {
+                            if (Math.abs(w.length - token.length) > 1) continue;
+                            if (simpleLevenshtein(token, w) <= 1) return true;
+                        }
+                    }
+                    return false;
+                };
+
+                filteredChannels = tvChannels.filter((c: any) => {
+                    const categories = getChannelCategories(c); // include category slugs
+                    const categoryStr = categories.join(' ');
+                    const hayRaw = `${c.name || ''} ${(c.description || '')} ${categoryStr}`.toLowerCase();
+                    const words = hayRaw.split(/[^a-z0-9]+/).filter(Boolean);
+                    const ok = tokens.some((t: string) => tokenMatches(t, hayRaw, words)); // OR logic
+                    if (ok) {
+                        if (seen.has(c.id)) return false;
+                        seen.add(c.id);
+                        return true;
+                    }
+                    return false;
+                }).slice(0, 200);
+                console.log(`🔎 Search results (OR+fuzzy): ${filteredChannels.length}`);
+            } else {
+                // === GENRE FILTERING (robusto) ===
+                let genreInput: string | undefined;
+                // extra come stringa: "genre=coppe&x=y"
+                if (typeof extra === 'string') {
+                    const parts = extra.split('&');
+                    for (const p of parts) {
+                        const [k,v] = p.split('=');
+                        if (k === 'genre' && v) genreInput = decodeURIComponent(v);
+                    }
+                }
+                // extra oggetto
+                if (!genreInput && extra && typeof extra === 'object' && extra.genre) genreInput = String(extra.genre);
+                // fallback ultima richiesta express
+                const lastReq: any = (global as any).lastExpressRequest;
+                if (!genreInput && lastReq?.query) {
+                    if (typeof lastReq.query.genre === 'string') genreInput = lastReq.query.genre;
+                    else if (typeof lastReq.query.extra === 'string') {
+                        const m = lastReq.query.extra.match(/genre=([^&]+)/i); if (m) genreInput = decodeURIComponent(m[1]);
+                    } else if (lastReq.query.extra && typeof lastReq.query.extra === 'object' && lastReq.query.extra.genre) {
+                        genreInput = String(lastReq.query.extra.genre);
+                    }
+                }
+                if (genreInput) {
+                    const norm = genreInput.trim().toLowerCase()
+                        .replace(/[àáâãä]/g,'a').replace(/[èéêë]/g,'e')
+                        .replace(/[ìíîï]/g,'i').replace(/[òóôõö]/g,'o')
+                        .replace(/[ùúûü]/g,'u');
+                    const genreMap: { [key: string]: string } = {
+                        'rai':'rai','mediaset':'mediaset','sky':'sky','bambini':'kids','news':'news','sport':'sport','cinema':'movies','generali':'general','documentari':'documentari','discovery':'discovery','pluto':'pluto','serie a':'seriea','serie b':'serieb','serie c':'seriec','coppe':'coppe','tennis':'tennis','f1':'f1','motogp':'motogp','basket':'basket','volleyball':'volleyball','ice hockey':'icehockey','wrestling':'wrestling','boxing':'boxing','darts':'darts','baseball':'baseball','nfl':'nfl'
+                    };
+                    const target = genreMap[norm] || norm;
+                    requestedSlug = target;
+                    filteredChannels = tvChannels.filter(ch => getChannelCategories(ch).includes(target));
+                    console.log(`🔍 Genre='${norm}' -> slug='${target}' results=${filteredChannels.length}`);
+                } else {
+                    console.log(`📺 No genre filter, showing all ${tvChannels.length} channels`);
+                }
+            }
+
+            // Se filtro richiesto e nessun canale trovato -> aggiungi placeholder
+            if (requestedSlug && filteredChannels.length === 0) {
+                const PLACEHOLDER_ID = `placeholder-${requestedSlug}`;
+                const PLACEHOLDER_LOGO_BASE = 'https://raw.githubusercontent.com/qwertyuiop8899/logo/main';
+                const placeholderLogo = `${PLACEHOLDER_LOGO_BASE}/nostream.png`;
+                filteredChannels = [{
+                    id: PLACEHOLDER_ID,
+                    name: 'Nessuno Stream disponibile oggi',
+                    logo: placeholderLogo,
+                    poster: placeholderLogo,
+                    type: 'tv',
+                    category: [requestedSlug],
+                    description: 'Nessuno Stream disponibile oggi. Live 🔴',
+                    _placeholder: true,
+                    placeholderVideo: `${PLACEHOLDER_LOGO_BASE}/nostream.mp4`
+                }];
             }
             
             // Aggiungi prefisso tv: agli ID, posterShape landscape e EPG
@@ -821,15 +833,29 @@ function createBuilder(initialConfig: AddonConfig = {}) {
                     background: (channel as any).background || (channel as any).poster || ''
                 };
                 
-                // Aggiungi EPG nel catalogo
-                if (epgManager) {
+                // Per canali dinamici: niente EPG, mostra solo ora inizio evento
+                if ((channel as any)._dynamic) {
+                    const eventStart = (channel as any).eventStart || (channel as any).eventstart; // fallback
+                    const baseDesc = channel.description || '';
+                    if (eventStart) {
+                        try {
+                            const dt = new Date(eventStart);
+                            const hhmm = dt.toLocaleTimeString('it-IT', { hour: '2-digit', minute: '2-digit', hour12: false, timeZone: 'Europe/Rome' }).replace(/\./g, ':');
+                            // Richiesto: linea unica iniziale con icona e orario + titolo evento
+                            channelWithPrefix.description = `🔴 Inizio: ${hhmm} ${channel.name}${baseDesc ? `\n${baseDesc}` : ''}`.trim();
+                        } catch {
+                            channelWithPrefix.description = baseDesc || channel.name;
+                        }
+                    } else {
+                        channelWithPrefix.description = baseDesc || channel.name;
+                    }
+                } else if (epgManager) {
+                    // Canali tradizionali: EPG
                     try {
                         const epgChannelIds = (channel as any).epgChannelIds;
                         const epgChannelId = epgManager.findEPGChannelId(channel.name, epgChannelIds);
-                        
                         if (epgChannelId) {
                             const currentProgram = await epgManager.getCurrentProgram(epgChannelId);
-                            
                             if (currentProgram) {
                                 const startTime = epgManager.formatTime(currentProgram.start);
                                 const endTime = currentProgram.stop ? epgManager.formatTime(currentProgram.stop) : '';
@@ -890,36 +916,40 @@ function createBuilder(initialConfig: AddonConfig = {}) {
                     language: "it"
                 };
                 
-                // Aggiungi EPG nel meta
-                if (epgManager) {
+                // Meta: canali dinamici senza EPG con ora inizio
+                if ((channel as any)._dynamic) {
+                    const eventStart = (channel as any).eventStart || (channel as any).eventstart;
+                    const baseDesc = channel.description || '';
+                    let finalDesc = baseDesc || channel.name;
+                    if (eventStart) {
+                        try {
+                            const dt = new Date(eventStart);
+                            const hhmm = dt.toLocaleTimeString('it-IT', { hour: '2-digit', minute: '2-digit', hour12: false, timeZone: 'Europe/Rome' }).replace(/\./g, ':');
+                            finalDesc = `🔴 Inizio: ${hhmm} ${channel.name}${baseDesc ? `\n${baseDesc}` : ''}`.trim();
+                        } catch {/* ignore */}
+                    }
+                    (metaWithPrefix as any).description = finalDesc;
+                } else if (epgManager) {
+                    // Meta: canali tradizionali con EPG
                     try {
                         const epgChannelIds = (channel as any).epgChannelIds;
                         const epgChannelId = epgManager.findEPGChannelId(channel.name, epgChannelIds);
-                        
                         if (epgChannelId) {
                             const currentProgram = await epgManager.getCurrentProgram(epgChannelId);
                             const nextProgram = await epgManager.getNextProgram(epgChannelId);
-                            
                             let epgDescription = channel.description || '';
-                            
                             if (currentProgram) {
                                 const startTime = epgManager.formatTime(currentProgram.start);
                                 const endTime = currentProgram.stop ? epgManager.formatTime(currentProgram.stop) : '';
                                 epgDescription += `\n\n🔴 IN ONDA ORA (${startTime}${endTime ? `-${endTime}` : ''}): ${currentProgram.title}`;
-                                if (currentProgram.description) {
-                                    epgDescription += `\n${currentProgram.description}`;
-                                }
+                                if (currentProgram.description) epgDescription += `\n${currentProgram.description}`;
                             }
-                            
                             if (nextProgram) {
                                 const nextStartTime = epgManager.formatTime(nextProgram.start);
                                 const nextEndTime = nextProgram.stop ? epgManager.formatTime(nextProgram.stop) : '';
                                 epgDescription += `\n\n⏭️ A SEGUIRE (${nextStartTime}${nextEndTime ? `-${nextEndTime}` : ''}): ${nextProgram.title}`;
-                                if (nextProgram.description) {
-                                    epgDescription += `\n${nextProgram.description}`;
-                                }
+                                if (nextProgram.description) epgDescription += `\n${nextProgram.description}`;
                             }
-                            
                             metaWithPrefix.description = epgDescription;
                         }
                     } catch (epgError) {
@@ -929,6 +959,35 @@ function createBuilder(initialConfig: AddonConfig = {}) {
                 
                 return { meta: metaWithPrefix };
             } else {
+                // Fallback per placeholder non persistiti in tvChannels
+                if (cleanId.startsWith('placeholder-')) {
+                    const slug = cleanId.replace('placeholder-', '') || 'general';
+                    const PLACEHOLDER_LOGO_BASE = 'https://raw.githubusercontent.com/qwertyuiop8899/logo/main';
+                    const placeholderLogo = `${PLACEHOLDER_LOGO_BASE}/nostream.png`;
+                    const placeholderVideo = `${PLACEHOLDER_LOGO_BASE}/nostream.mp4`;
+                    const name = 'Nessuno Stream disponibile oggi';
+                    const meta = {
+                        id: `tv:${cleanId}`,
+                        type: 'tv',
+                        name,
+                        posterShape: 'landscape',
+                        poster: placeholderLogo,
+                        logo: placeholderLogo,
+                        background: placeholderLogo,
+                        description: 'Nessuno Stream disponibile oggi. Live 🔴',
+                        genre: [slug],
+                        genres: [slug],
+                        year: new Date().getFullYear().toString(),
+                        imdbRating: null,
+                        releaseInfo: 'Live TV',
+                        country: 'IT',
+                        language: 'it',
+                        _placeholder: true,
+                        placeholderVideo
+                    } as any;
+                    console.log(`🧩 Generated dynamic placeholder meta for missing channel ${cleanId}`);
+                    return { meta };
+                }
                 console.log(`❌ No meta found for channel ID: ${id}`);
                 return { meta: null };
             }
@@ -965,6 +1024,13 @@ function createBuilder(initialConfig: AddonConfig = {}) {
 
                 // === LOGICA TV ===
                 if (type === "tv") {
+                    // Assicura che i canali dinamici siano presenti anche se la prima richiesta è uno stream (senza passare dal catalog)
+                    try {
+                        loadDynamicChannels(false);
+                        tvChannels = mergeDynamic([...staticBaseChannels]);
+                    } catch (e) {
+                        console.error('❌ Stream handler: mergeDynamic failed:', e);
+                    }
                     // Improved channel ID parsing to handle different formats from Stremio
                     let cleanId = id;
                     
@@ -985,9 +1051,25 @@ function createBuilder(initialConfig: AddonConfig = {}) {
                     const channel = tvChannels.find((c: any) => c.id === cleanId);
                     
                     if (!channel) {
+                        // Gestione placeholder non presente in tvChannels
+                        if (cleanId.startsWith('placeholder-')) {
+                            const PLACEHOLDER_LOGO_BASE = 'https://raw.githubusercontent.com/qwertyuiop8899/logo/main';
+                            const placeholderVideo = `${PLACEHOLDER_LOGO_BASE}/nostream.mp4`;
+                            console.log(`🧩 Placeholder channel requested (ephemeral): ${cleanId}`);
+                            return { streams: [ { url: placeholderVideo, title: 'Nessuno Stream' } ] };
+                        }
                         console.log(`❌ Channel ${id} not found`);
                         debugLog(`❌ Channel not found in the TV channels list. Original ID: ${id}, Clean ID: ${cleanId}`);
                         return { streams: [] };
+                    }
+
+                    // Gestione placeholder: ritorna un singolo "stream" fittizio (immagine)
+                    if ((channel as any)._placeholder) {
+                        const vid = (channel as any).placeholderVideo || (channel as any).logo || (channel as any).poster || '';
+                        return { streams: [ {
+                            url: vid,
+                            title: 'Nessuno Stream'
+                        } ] };
                     }
                     
                     console.log(`✅ Found channel: ${channel.name}`);
@@ -997,18 +1079,75 @@ function createBuilder(initialConfig: AddonConfig = {}) {
                     debugLog(`Config DEBUG - mediaFlowProxyPassword: ${config.mediaFlowProxyPassword ? '***' : 'NOT SET'}`);
                     
                     let streams: { url: string; title: string }[] = [];
+                    // Stato toggle MPD (solo da config checkbox, niente override da env per evitare comportamento inatteso)
+                    const mpdEnabled = !!config.enableMpd;
 
-                    // staticUrlF: sempre Direct
-                    if ((channel as any).staticUrlF) {
-                        streams.push({
-                            url: (channel as any).staticUrlF,
-                            title: `[🌍dTV] ${channel.name} [ITA]`
+                    // Dynamic event channels: dynamicDUrls -> usa stessa logica avanzata di staticUrlD per estrarre link finale
+                    if ((channel as any)._dynamic) {
+                        const dArr = Array.isArray((channel as any).dynamicDUrls) ? (channel as any).dynamicDUrls : [];
+                        console.log(`[DynamicStreams] Channel ${channel.id} dynamicDUrls count=${dArr.length}`);
+                        if (dArr.length === 0) {
+                            console.log(`[DynamicStreams] ⚠️ Nessuno stream dinamico presente nel canale (dynamicDUrls vuoto)`);
+                        }
+                    }
+                    let dynamicHandled = false;
+                    if ((channel as any)._dynamic && Array.isArray((channel as any).dynamicDUrls) && (channel as any).dynamicDUrls.length) {
+                        const startDyn = Date.now();
+                        // Parallelizza risoluzione con limite di concorrenza per non saturare proxy
+                        const entries: { url: string; title?: string }[] = (channel as any).dynamicDUrls;
+                        const resolved: { url: string; title: string }[] = [];
+                        const CONCURRENCY = 4;
+                        let index = 0;
+                        const itaRegex = /\b(it|ita|italy|italian)$/i;
+                        const worker = async () => {
+                            while (index < entries.length) {
+                                const i = index++;
+                                const d = entries[i];
+                                if (!d || !d.url) continue;
+                                let providerTitle = (d.title || 'Stream').trim().replace(/^\((.*)\)$/,'$1').trim();
+                                if (itaRegex.test(providerTitle) && !providerTitle.startsWith('🇮🇹')) providerTitle = `🇮🇹 ${providerTitle}`;
+                                const r = await resolveDynamicEventUrl(d.url, providerTitle, mfpUrl, mfpPsw);
+                                resolved.push(r);
+                            }
+                        };
+                        const workers = Array(Math.min(CONCURRENCY, entries.length)).fill(0).map(() => worker());
+                        await Promise.all(workers);
+                        resolved.sort((a, b) => {
+                            const itaA = a.title.startsWith('🇮🇹') ? 0 : 1;
+                            const itaB = b.title.startsWith('🇮🇹') ? 0 : 1;
+                            if (itaA !== itaB) return itaA - itaB;
+                            return a.title.localeCompare(b.title);
                         });
-                        debugLog(`Aggiunto staticUrlF Direct: ${(channel as any).staticUrlF}`);
+                        for (const r of resolved) streams.push(r);
+                        debugLog(`[DynamicStreams] Resolved ${resolved.length} dynamic streams in ${Date.now() - startDyn}ms`);
+                        dynamicHandled = true;
+                    } else if ((channel as any)._dynamic) {
+                        // Dynamic channel ma senza dynamicDUrls -> placeholder stream
+                        streams.push({ url: (channel as any).placeholderVideo || (channel as any).logo || (channel as any).poster || '', title: 'Nessuno Stream' });
+                        dynamicHandled = true;
+                    } else {
+                        // staticUrlF: Direct for non-dynamic
+                        if ((channel as any).staticUrlF) {
+                            const originalF = (channel as any).staticUrlF;
+                            const nameLower = (channel.name || '').toLowerCase().trim();
+                            const raiMpdSet = new Set(['rai 1','rai 2','rai 3']); // Solo questi devono passare da proxy MPD
+                            // Altri canali RAI (4,5,Movie,Premium, ecc.) restano DIRECT (niente proxy HLS come richiesto)
+                            let finalFUrl = originalF;
+                            if (mfpUrl && mfpPsw && raiMpdSet.has(nameLower)) {
+                                if (!originalF.startsWith(mfpUrl)) {
+                                    finalFUrl = `${mfpUrl}/proxy/mpd/manifest.m3u8?api_password=${encodeURIComponent(mfpPsw)}&d=${encodeURIComponent(originalF)}`;
+                                }
+                            }
+                            streams.push({
+                                url: finalFUrl,
+                                title: `[🌍dTV] ${channel.name} [ITA]`
+                            });
+                            debugLog(`Aggiunto staticUrlF ${finalFUrl === originalF ? 'Direct' : 'Proxy(MPD)' }: ${finalFUrl}`);
+                        }
                     }
 
                     // staticUrl (solo se enableMpd è attivo)
-                    if ((channel as any).staticUrl && (config.enableMpd === 'on' || process.env.ENABLE_MPD?.toLowerCase() === 'true')) {
+                    if ((channel as any).staticUrl && mpdEnabled) {
                         console.log(`🔧 [staticUrl] Raw URL: ${(channel as any).staticUrl}`);
                         const decodedUrl = decodeStaticUrl((channel as any).staticUrl);
                         console.log(`🔧 [staticUrl] Decoded URL: ${decodedUrl}`);
@@ -1045,7 +1184,7 @@ function createBuilder(initialConfig: AddonConfig = {}) {
                         }
                     }
                     // staticUrl2 (solo se enableMpd è attivo)
-                    if ((channel as any).staticUrl2 && (config.enableMpd === 'on' || process.env.ENABLE_MPD?.toLowerCase() === 'true')) {
+                    if ((channel as any).staticUrl2 && mpdEnabled) {
                         console.log(`🔧 [staticUrl2] Raw URL: ${(channel as any).staticUrl2}`);
                         const decodedUrl = decodeStaticUrl((channel as any).staticUrl2);
                         console.log(`🔧 [staticUrl2] Decoded URL: ${decodedUrl}`);
@@ -1280,6 +1419,14 @@ function createBuilder(initialConfig: AddonConfig = {}) {
                         }
                     }
 
+                    // Se già gestito come evento dinamico, salta Vavoo/TVTap e ritorna subito
+                    if (dynamicHandled) {
+                        for (const s of streams) {
+                            allStreams.push({ name: 'Live 🔴', title: s.title, url: s.url });
+                        }
+                        console.log(`✅ Returning ${allStreams.length} dynamic event streams`);
+                        return { streams: allStreams };
+                    }
                     // --- TVTAP: cerca usando vavooNames ---
                     const vavooNamesArr = (channel as any).vavooNames || [channel.name];
                     console.log(`[TVTap] Cerco canale con vavooNames:`, vavooNamesArr);
@@ -1363,7 +1510,7 @@ function createBuilder(initialConfig: AddonConfig = {}) {
                     // Dopo aver popolato streams (nella logica TV):
                     for (const s of streams) {
                         allStreams.push({
-                            name: 'StreamViX TV',
+                            name: 'Live 🔴',
                             title: s.title,
                             url: s.url
                         });
@@ -1377,15 +1524,18 @@ function createBuilder(initialConfig: AddonConfig = {}) {
                 // === LOGICA ANIME/FILM (originale) ===
                 // Per tutto il resto, usa solo mediaFlowProxyUrl/mediaFlowProxyPassword
                 // Gestione AnimeUnity per ID Kitsu o MAL con fallback variabile ambiente
-                const animeUnityEnabled = (config.animeunityEnabled === 'on') || 
-                                        (process.env.ANIMEUNITY_ENABLED?.toLowerCase() === 'true');
+                // Provider flags: default ON unless explicitly disabled
+                const envFlag = (name: string) => {
+                    const v = process.env[name];
+                    if (!v) return undefined;
+                    return v.toLowerCase() === 'true';
+                };
+                const animeUnityEnabled = envFlag('ANIMEUNITY_ENABLED') ?? (config.animeunityEnabled === false ? false : true);
+                const animeSaturnEnabled = envFlag('ANIMESATURN_ENABLED') ?? (config.animesaturnEnabled === false ? false : true);
+                const animeWorldEnabled = envFlag('ANIMEWORLD_ENABLED') ?? (config.animeworldEnabled === false ? false : true);
                 
-                // Gestione AnimeSaturn per ID Kitsu o MAL con fallback variabile ambiente
-                const animeSaturnEnabled = (config.animesaturnEnabled === 'on') || 
-                                        (process.env.ANIMESATURN_ENABLED?.toLowerCase() === 'true');
-                
-                // Gestione parallela AnimeUnity e AnimeSaturn per ID Kitsu, MAL, IMDB, TMDB
-                if ((id.startsWith('kitsu:') || id.startsWith('mal:') || id.startsWith('tt') || id.startsWith('tmdb:')) && (animeUnityEnabled || animeSaturnEnabled)) {
+                // Gestione parallela AnimeUnity / AnimeSaturn / AnimeWorld
+                if ((id.startsWith('kitsu:') || id.startsWith('mal:') || id.startsWith('tt') || id.startsWith('tmdb:')) && (animeUnityEnabled || animeSaturnEnabled || animeWorldEnabled)) {
                     const animeUnityConfig: AnimeUnityConfig = {
                         enabled: animeUnityEnabled,
                         mfpUrl: config.mediaFlowProxyUrl || process.env.MFP_URL || '',
@@ -1398,10 +1548,17 @@ function createBuilder(initialConfig: AddonConfig = {}) {
                         mfpPassword: config.mediaFlowProxyPassword || process.env.MFP_PSW || '',
                         mfpProxyUrl: config.mediaFlowProxyUrl || process.env.MFP_URL || '',
                         mfpProxyPassword: config.mediaFlowProxyPassword || process.env.MFP_PSW || '',
-                        tmdbApiKey: config.tmdbApiKey || process.env.TMDB_API_KEY || ''
+                        tmdbApiKey: config.tmdbApiKey || process.env.TMDB_API_KEY || '40a9faa1f6741afb2c0c40238d85f8d0'
+                    };
+                    const animeWorldConfig = {
+                        enabled: animeWorldEnabled,
+                        mfpUrl: config.mediaFlowProxyUrl || process.env.MFP_URL || '',
+                        mfpPassword: config.mediaFlowProxyPassword || process.env.MFP_PSW || '',
+                        tmdbApiKey: config.tmdbApiKey || process.env.TMDB_API_KEY || '40a9faa1f6741afb2c0c40238d85f8d0'
                     };
                     let animeUnityStreams: Stream[] = [];
                     let animeSaturnStreams: Stream[] = [];
+                    let animeWorldStreams: Stream[] = [];
                     // Parsing stagione/episodio per IMDB/TMDB
                     let seasonNumber: number | null = null;
                     let episodeNumber: number | null = null;
@@ -1475,6 +1632,35 @@ function createBuilder(initialConfig: AddonConfig = {}) {
                             console.error('[AnimeSaturn] Errore:', error);
                         }
                     }
+                    // AnimeWorld (always attempt if enabled, even if others produced streams)
+                    if (animeWorldEnabled) {
+                        try {
+                            const { AnimeWorldProvider } = await import('./providers/animeworld-provider');
+                            const animeWorldProvider = new AnimeWorldProvider(animeWorldConfig);
+                            let animeWorldResult;
+                            if (id.startsWith('kitsu:')) {
+                                console.log(`[AnimeWorld] Processing Kitsu ID: ${id}`);
+                                animeWorldResult = await animeWorldProvider.handleKitsuRequest(id);
+                            } else if (id.startsWith('mal:')) {
+                                console.log(`[AnimeWorld] Processing MAL ID: ${id}`);
+                                animeWorldResult = await animeWorldProvider.handleMalRequest(id);
+                            } else if (id.startsWith('tt')) {
+                                console.log(`[AnimeWorld] Processing IMDB ID: ${id}`);
+                                animeWorldResult = await animeWorldProvider.handleImdbRequest(id, seasonNumber, episodeNumber, isMovie);
+                            } else if (id.startsWith('tmdb:')) {
+                                console.log(`[AnimeWorld] Processing TMDB ID: ${id}`);
+                                animeWorldResult = await animeWorldProvider.handleTmdbRequest(id.replace('tmdb:', ''), seasonNumber, episodeNumber, isMovie);
+                            }
+                            if (animeWorldResult && animeWorldResult.streams) {
+                                animeWorldStreams = animeWorldResult.streams;
+                                for (const s of animeWorldStreams) {
+                                    allStreams.push({ ...s, name: 'StreamViX AW' });
+                                }
+                            }
+                        } catch (error) {
+                            console.error('[AnimeWorld] Errore:', error);
+                        }
+                    }
                 }
                 
                 // Mantieni logica VixSrc per tutti gli altri ID
@@ -1526,6 +1712,12 @@ const app = express();
 
 app.use('/public', express.static(path.join(__dirname, '..', 'public')));
 
+// Salva l'ultima request Express per fallback nel catalog handler (quando il router interno non passa req)
+app.use((req: Request, _res: Response, next: NextFunction) => {
+    (global as any).lastExpressRequest = req;
+    next();
+});
+
 // ✅ CORRETTO: Annotazioni di tipo esplicite per Express
 app.get('/', (_: Request, res: Response) => {
     const manifest = loadCustomConfig();
@@ -1536,20 +1728,27 @@ app.get('/', (_: Request, res: Response) => {
 
 // ✅ Middleware semplificato che usa sempre il router globale
 app.use((req: Request, res: Response, next: NextFunction) => {
+    // Inject the search query directly into req.query.search for AnimeWorld catalog requests
+    if (
+        req.path === '/catalog/animeworld/anime/search.json' &&
+        req.query && typeof req.query.query === 'string'
+    ) {
+        req.query.search = req.query.query;
+    }
     debugLog(`Incoming request: ${req.method} ${req.path}`);
     debugLog(`Full URL: ${req.url}`);
     debugLog(`Path segments:`, req.path.split('/'));
-    
+
     const configString = req.path.split('/')[1];
     debugLog(`Config string extracted: "${configString}" (length: ${configString ? configString.length : 0})`);
-    
+
     // AGGIORNA SOLO LA CACHE GLOBALE senza ricreare il builder
     if (configString && configString.includes('eyJtZnBQcm94eVVybCI6Imh0dHA6Ly8xOTIuMTY4LjEuMTAwOjkwMDAi')) {
         debugLog('📌 Found known MFP config pattern, updating global cache');
         // Non forzare più nessun valore hardcoded, lascia solo la configurazione fornita
         // Object.assign(configCache, { ... }); // RIMOSSO
     }
-    
+
     // Altri parsing di configurazione (PRIMA della logica TV)
     if (configString && configString.length > 10 && !configString.startsWith('stream') && !configString.startsWith('meta') && !configString.startsWith('manifest')) {
         const parsedConfig = parseConfigFromArgs(configString);
@@ -1559,7 +1758,7 @@ app.use((req: Request, res: Response, next: NextFunction) => {
             debugLog('� Updated global config cache:', configCache);
         }
     }
-    
+
     // Per le richieste di stream TV, assicurati che la configurazione proxy sia sempre presente
     if (req.url.includes('/stream/tv/') || req.url.includes('/stream/tv%3A')) {
         debugLog('📺 TV Stream request detected, ensuring MFP configuration');
@@ -1567,7 +1766,7 @@ app.use((req: Request, res: Response, next: NextFunction) => {
         // if (!configCache.mfpProxyUrl || !configCache.mfpProxyPassword) { ... } // RIMOSSO
         debugLog('📺 Current proxy config for TV streams:', configCache);
     }
-    
+
     // Altri parsing di configurazione
     if (configString && configString.length > 10 && !configString.startsWith('stream') && !configString.startsWith('meta') && !configString.startsWith('manifest')) {
         const parsedConfig = parseConfigFromArgs(configString);
@@ -1577,7 +1776,30 @@ app.use((req: Request, res: Response, next: NextFunction) => {
             debugLog('� Updated global config cache:', configCache);
         }
     }
-    
+
+    // PATCH: Inject full search query for AnimeWorld catalog search
+    if (
+        req.path === '/catalog/animeworld/anime/search.json' &&
+        req.query && typeof req.query.query === 'string'
+    ) {
+        debugLog('🔎 PATCH: Injecting full search query from req.query.query:', req.query.query);
+        // Ensure req.query.extra is always an object
+        let extraObj: any = {};
+        if (req.query.extra) {
+            if (typeof req.query.extra === 'string') {
+                try {
+                    extraObj = JSON.parse(req.query.extra);
+                } catch (e) {
+                    extraObj = {};
+                }
+            } else if (typeof req.query.extra === 'object') {
+                extraObj = req.query.extra;
+            }
+        }
+        extraObj.search = req.query.query;
+        req.query.extra = extraObj;
+    }
+
     // ✅ Inizializza il router globale se non è ancora stato fatto
     if (!globalRouter) {
         console.log('🔧 Initializing global router...');
@@ -1586,7 +1808,7 @@ app.use((req: Request, res: Response, next: NextFunction) => {
         globalRouter = getRouter(globalAddonInterface);
         console.log('✅ Global router initialized');
     }
-    
+
     // USA SEMPRE il router globale
     globalRouter(req, res, next);
 });
@@ -1643,6 +1865,54 @@ app.get('/tvtap-resolve/:channelId', async (req: Request, res: Response) => {
     }
 });
 
+// ================= MANUAL LIVE UPDATE ENDPOINT =================
+// GET /live/update?token=XYZ (token optional if LIVE_UPDATE_TOKEN not set)
+app.get('/live/update', async (req: Request, res: Response) => {
+    try {
+        const requiredToken = process?.env?.LIVE_UPDATE_TOKEN;
+        const provided = (req.query.token as string) || '';
+        if (requiredToken && provided !== requiredToken) {
+            return res.status(403).json({ ok: false, error: 'Forbidden' });
+        }
+        // Esegue Live.py immediatamente (se esiste) e ricarica i canali
+        // riutilizza executeLiveScript già definita nello scheduler.
+        // Per evitare race con scheduler, non serve lock: executeLiveScript usa una singola run.
+        await (async () => { try { await (executeLiveScript as any)(); } catch {} })();
+        return res.json({ ok: true, message: 'Live.py eseguito (se presente) e canali ricaricati' });
+    } catch (e: any) {
+        return res.status(500).json({ ok: false, error: e?.message || String(e) });
+    }
+});
+
+// ================= MANUAL RELOAD ENDPOINT =====================
+// Invalida la cache dinamica e forza una ricarica
+app.get('/live/reload', (_: Request, res: Response) => {
+    try {
+        invalidateDynamicChannels();
+        const dyn = loadDynamicChannels(true);
+        console.log(`🔄 /live/reload eseguito: canali dinamici attuali=${dyn.length}`);
+        res.json({ ok: true, dynamicCount: dyn.length });
+    } catch (e: any) {
+        res.status(500).json({ ok: false, error: e?.message || String(e) });
+    }
+});
+// =============================================================
+
+// ================= MANUAL PURGE ENDPOINT =====================
+// Esegue la stessa logica delle 02:00: rimuove dal file gli eventi del giorno precedente
+app.get('/live/purge', (req: Request, res: Response) => {
+    try {
+        const result = purgeOldDynamicEvents();
+        // Ricarica cache in memoria
+        loadDynamicChannels(true);
+        res.json({ ok: true, ...result });
+    } catch (e: any) {
+        res.status(500).json({ ok: false, error: e?.message || String(e) });
+    }
+});
+// =============================================================
+// ================================================================
+
 const PORT = process.env.PORT || 7860;
 app.listen(PORT, () => {
     console.log(`Addon server running on http://127.0.0.1:${PORT}`);
@@ -1664,3 +1934,165 @@ function ensureCacheDirectories(): void {
 
 // Assicurati che le directory di cache esistano all'avvio
 ensureCacheDirectories();
+
+// ================== LIVE EVENTS SCHEDULER (Live.py) ==================
+// Esegue lo script Live.py alle 10:00 e 15:00 Europe/Rome, ricarica i canali dinamici
+// Lo script Python dovrà scrivere config/dynamic_channels.json con il formato previsto.
+
+interface ScheduledRun {
+    hour: number;
+    minute: number;
+}
+
+const LIVE_SCRIPT_PATH = path.join(__dirname, '..', 'Live.py');
+const LIVE_LOG_DIR = path.join(__dirname, '../logs');
+const LIVE_LOG_FILE = path.join(LIVE_LOG_DIR, 'live_scheduler.log');
+if (!fs.existsSync(LIVE_LOG_DIR)) {
+    try { fs.mkdirSync(LIVE_LOG_DIR, { recursive: true }); } catch { /* ignore */ }
+}
+
+const liveRuns: ScheduledRun[] = [
+    { hour: 10, minute: 0 }, // 10:00 CET/CEST
+    { hour: 15, minute: 0 }  // 15:00 CET/CEST
+];
+
+function logLive(msg: string, ...extra: any[]) {
+    const stamp = new Date().toISOString();
+    const line = `${stamp} [LIVE] ${msg} ${extra.length ? JSON.stringify(extra) : ''}\n`;
+    try { fs.appendFileSync(LIVE_LOG_FILE, line); } catch { /* ignore */ }
+    console.log(line.trim());
+}
+
+function nowRome(): Date {
+    return new Date(new Date().toLocaleString('en-US', { timeZone: 'Europe/Rome' }));
+}
+
+function computeDelayToNextRun(): number {
+    const romeNow = nowRome();
+    let nextDiff = Number.MAX_SAFE_INTEGER;
+    for (const run of liveRuns) {
+        const target = new Date(romeNow.getTime());
+        target.setHours(run.hour, run.minute, 0, 0);
+        let diff = target.getTime() - romeNow.getTime();
+        if (diff < 0) diff += 24 * 60 * 60 * 1000; // giorno successivo
+        if (diff < nextDiff) nextDiff = diff;
+    }
+    return nextDiff === Number.MAX_SAFE_INTEGER ? 60 * 60 * 1000 : nextDiff;
+}
+
+async function executeLiveScript() {
+    if (!fs.existsSync(LIVE_SCRIPT_PATH)) {
+        logLive('Live.py non trovato, skip esecuzione');
+        return;
+    }
+    logLive('Esecuzione Live.py avviata');
+    try {
+        const { execFile } = require('child_process');
+        await new Promise<void>((resolve) => {
+            const child = execFile('python3', [LIVE_SCRIPT_PATH], { timeout: 1000 * 60 * 4 }, (err: any, stdout: string, stderr: string) => {
+                if (stdout) logLive('Output Live.py', stdout.slice(0, 800));
+                if (stderr) logLive('Stderr Live.py', stderr.slice(0, 800));
+                if (err) logLive('Errore Live.py', err.message || err);
+                resolve();
+            });
+            // Safety: se child resta appeso oltre timeout integrato execFile lancerà errore
+            child.on('error', (e: any) => logLive('Errore processo Live.py', e.message || e));
+        });
+        // Ricarica canali dinamici (force) e svuota cache tvChannels merge (ricarico solo dynamic parte)
+        loadDynamicChannels(true);
+        logLive('Reload canali dinamici completato dopo Live.py');
+    } catch (e: any) {
+        logLive('Eccezione esecuzione Live.py', e?.message || String(e));
+    }
+}
+
+function scheduleNextLiveRun() {
+    const delay = computeDelayToNextRun();
+    logLive('Prossima esecuzione Live.py tra ms', delay);
+    setTimeout(async () => {
+        await executeLiveScript();
+        scheduleNextLiveRun();
+    }, delay);
+}
+
+// Avvia scheduler dopo avvio server (dopo breve delay per evitare conflitto startup)
+setTimeout(() => {
+    logLive('Scheduler Live eventi attivato');
+    scheduleNextLiveRun();
+}, 5000);
+// ====================================================================
+
+// ================== AUTO PURGE SCHEDULER ============================
+function computeDelayToNextPurge(): number {
+    const romeNow = new Date(new Date().toLocaleString('en-US', { timeZone: 'Europe/Rome' }));
+    const target = new Date(romeNow.getTime());
+    target.setHours(2, 5, 0, 0); // 02:05 Rome
+    let diff = target.getTime() - romeNow.getTime();
+    if (diff < 0) diff += 24 * 60 * 60 * 1000; // domani
+    return diff;
+}
+
+function scheduleNextAutoPurge() {
+    const delay = computeDelayToNextPurge();
+    console.log(`🗓️ Prossimo purge automatico alle 02:05 Rome tra ms: ${delay}`);
+    setTimeout(() => {
+        try {
+            const result = purgeOldDynamicEvents();
+            loadDynamicChannels(true);
+            console.log(`🧹 Purge automatico eseguito: removed=${result.removed} after=${result.after}`);
+        } catch (e) {
+            console.error('❌ Errore purge automatico:', e);
+        } finally {
+            scheduleNextAutoPurge();
+        }
+    }, delay);
+}
+
+// Avvia scheduling purge dopo avvio server (leggero delay per startup)
+setTimeout(() => scheduleNextAutoPurge(), 7000);
+// ====================================================================
+
+// =============== WATCHER dynamic_channels.json =======================
+try {
+    const dynamicFilePath = path.join(__dirname, '../config/dynamic_channels.json');
+    if (fs.existsSync(dynamicFilePath)) {
+        fs.watch(dynamicFilePath, { persistent: false }, (evt) => {
+            if (evt === 'change') {
+                console.log('🔄 Detected change in dynamic_channels.json -> invalidate & reload');
+                invalidateDynamicChannels();
+                loadDynamicChannels(true);
+            }
+        });
+        console.log('👁️  Watch attivo su dynamic_channels.json');
+    }
+} catch (e) {
+    console.error('❌ Impossibile attivare watcher dynamic_channels.json:', e);
+}
+// ====================================================================
+
+// =============== DAILY 02:30 ROME RELOAD =============================
+function computeDelayToDailyReload(): number {
+    const romeNow = new Date(new Date().toLocaleString('en-US', { timeZone: 'Europe/Rome' }));
+    const target = new Date(romeNow.getTime());
+    target.setHours(2, 30, 0, 0); // 02:30 Rome
+    let diff = target.getTime() - romeNow.getTime();
+    if (diff < 0) diff += 24 * 60 * 60 * 1000;
+    return diff;
+}
+function scheduleDailyReload() {
+    const delay = computeDelayToDailyReload();
+    console.log(`🗓️ Prossimo reload dinamici alle 02:30 Rome tra ms: ${delay}`);
+    setTimeout(() => {
+        try {
+            invalidateDynamicChannels();
+            const dyn = loadDynamicChannels(true);
+            console.log(`🔁 Reload automatico 02:30 completato: dynamicCount=${dyn.length}`);
+        } catch (e) {
+            console.error('❌ Errore reload automatico 02:30:', e);
+        } finally {
+            scheduleDailyReload();
+        }
+    }, delay);
+}
+setTimeout(() => scheduleDailyReload(), 9000);
+// ====================================================================
